@@ -261,9 +261,10 @@ export function apply(ctx, config = {}) {
     state.inRetryTurn = false
     if (data.reason?.kind !== 'max-tokens') {
       if (wasRetry && state.ladder) {
-        // The rewritten input got through: the ladder is done.
+        // The rewritten input got through: the ladder is done. Goal calls append to the
+        // log, which cannot happen inside this event's dispatch, so they wait for idle.
         state.ladder = undefined
-        resumeGoal(agent)
+        state.afterIdle = 'resume-goal'
       }
       return
     }
@@ -283,7 +284,7 @@ export function apply(ctx, config = {}) {
       if (!input) return
       state.ladder = { kind: input.kind, attempts: [{ ...attempt, input: input.text, deleteFrom: input.deleteFrom }] }
     }
-    if (state.ladder.attempts.length > cfg.maxRetries) { giveUp(agent, state); return }
+    if (state.ladder.attempts.length > cfg.maxRetries) { state.ladder = undefined; state.afterIdle = 'give-up'; return }
     state.pending = true
   }
 
@@ -417,7 +418,12 @@ export function apply(ctx, config = {}) {
   ctx.on('agent/status', ({ agent, status }) => {
     if (status !== 'idle') return
     const state = states.get(agent)
-    if (state?.pending) void retry(agent, state)
+    if (state === undefined) return
+    const action = state.afterIdle
+    state.afterIdle = undefined
+    if (action === 'resume-goal') resumeGoal(agent)
+    else if (action === 'give-up') giveUp(agent, state)
+    if (state.pending) void retry(agent, state)
   })
 
   if (cfg.restoreAdapterMaxTokens) {

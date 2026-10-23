@@ -15,7 +15,12 @@ function harness({ rewrites = [], goalActivation = 'disarmed', model = 'deepseek
   let turn = 0
   let step = null
   let assistantId = 0
-  const emit = (name, ...args) => { for (const fn of listeners.get(name) ?? []) fn(...args) }
+  let emitting = false
+  const emit = (name, ...args) => {
+    const outer = emitting
+    if (name === 'session/event') emitting = true
+    try { for (const fn of listeners.get(name) ?? []) fn(...args) } finally { emitting = outer }
+  }
   const append = (type, data, opts) => {
     session.append(type, data, opts)
     emit('session/event', session, session.snapshotEvents().at(-1))
@@ -43,7 +48,12 @@ function harness({ rewrites = [], goalActivation = 'disarmed', model = 'deepseek
   const ctx = {
     logger: { info() {}, warn() {} },
     agents: { get: id => id === 's1' ? agent : undefined },
-    goals: { get: () => goal, resume: (...a) => calls.resume.push(a), block: (...a) => calls.block.push(a) },
+    // Like the real registry, goal mutations append to the log, so they fail inside an event dispatch.
+    goals: {
+      get: () => goal,
+      resume: (...a) => { if (emitting) throw new Error('session append cannot reenter'); calls.resume.push(a) },
+      block: (...a) => { if (emitting) throw new Error('session append cannot reenter'); calls.block.push(a) },
+    },
     llm: {
       stream(options) {
         calls.rewriteRequests.push(options.messages[0].content[0].text)
@@ -161,6 +171,8 @@ test('a successful re-run ends the ladder and resumes the goal', async () => {
   await h.idle()
   h.assistant([{ type: 'text', text: 'done' }])
   h.end('completed')
+  assert.equal(h.calls.resume.length, 0, 'not inside the turn/end dispatch')
+  await h.idle()
   assert.equal(h.calls.resume.length, 1)
   h.user('NEXT')
   h.assistant([{ type: 'reasoning', text: 'y' }])
