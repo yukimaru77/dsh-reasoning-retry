@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { Session } from '@deepseek-ai/dsh-session'
 import { createSystemMessage, createToolResultMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
-import { apply, clip, renderGuidance, renderRewriteRequest, staleMaxTokens, stepInput } from '../index.js'
+import { apply, clip, failedNodes, renderGuidance, renderRewriteRequest, staleMaxTokens, stepInput } from '../index.js'
 
 const tick = (ms = 20) => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -44,6 +44,20 @@ function harness({ rewrites = [], goalActivation = 'disarmed', model = 'deepseek
         return (async function* () { if (text !== undefined) yield { type: 'text-delta', index: 0, text } })()
       },
     },
+    commands: {
+      defs: new Map(),
+      register(def) { this.defs.set(def.name, def); return () => {} },
+      // Mirrors dsh-commands' executor: log-only command/run + command/done around the handler.
+      async execute(target, line, attachments, signal) {
+        const [, name, rawInput] = line.match(/^\/(\S+)\s?([\s\S]*)$/)
+        const def = this.defs.get(name)
+        const commandId = `cmd-${calls.commands = (calls.commands ?? 0) + 1}`
+        append('command/run', { commandId, name, ...(def.recordInput === false ? {} : { args: rawInput }), source: { kind: 'user' } })
+        const result = await def.handler({ commandId, agent: target, rawInput, attachments, signal })
+        append('command/done', { commandId, kind: result.kind, text: result.text })
+        return { commandId, result }
+      },
+    },
     systemPrompt: { context: (c) => { calls.context = c; return () => {} } },
     effect: (fn) => fn(),
     on(name, fn) { listeners.set(name, [...(listeners.get(name) ?? []), fn]); return () => {} },
@@ -60,8 +74,10 @@ function harness({ rewrites = [], goalActivation = 'disarmed', model = 'deepseek
     },
     end(kind) { append('turn/end', { turn, reason: { kind } }) },
     async idle() { emit('agent/status', { agent, status: 'idle' }); await tick() },
+    cards() { return session.snapshotEvents().filter(e => e.type === 'command/done').map(e => e.data.text) },
     visible() { return session.deriveMessages().map(m => `${m.role}:${m.content.map(b => b.text ?? b.type).join('|')}`) },
   }
+  api.ctxCommands = () => ctx.commands
   apply(ctx, { maxRetries: 2 })
   return api
 }
@@ -163,4 +179,49 @@ test('standing guidance names the budget and applies to DeepSeek only', () => {
   const codex = harness({ model: 'gpt-6.1-sol' })
   assert.equal(codex.calls.context.text({ scope: codex.agent }), '')
   assert.match(renderGuidance(undefined), /limited/)
+})
+
+test('an automatic re-run leaves an AI-hidden card that the model never sees', async () => {
+  const h = harness({ rewrites: ['STEP 1'] })
+  h.user('BIG TASK')
+  h.assistant([{ type: 'reasoning', text: 'x' }])
+  h.end('max-tokens')
+  await h.idle()
+  const cards = h.cards()
+  assert.equal(cards.length, 1)
+  assert.match(cards[0], /^🚫 AI非表示：直前の入力と返答（turn 1）/)
+  const types = h.session.snapshotEvents().map(e => e.type)
+  assert.ok(types.lastIndexOf('command/done') < types.lastIndexOf('user/message'), 'the card sits before the re-run')
+  assert.deepEqual(h.visible(), ['system:SYS', 'user:STEP 1'])
+})
+
+test('/clean-failed-steps hides earlier cut-off replies and old retry notices, keeping the rest', async () => {
+  const h = harness()
+  h.user('TASK A')
+  h.assistant([{ type: 'reasoning', text: 'long' }])
+  h.end('max-tokens')
+  h.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'OLD NOTICE' }], source: { kind: 'reasoning-retry' } }))
+  h.assistant([{ type: 'text', text: 'ok A' }])
+  h.end('completed')
+  h.user('TASK B')
+  h.assistant([{ type: 'tool-call', id: 'c1', name: 'bash', arguments: {} }])
+  h.tool('c1', 'out')
+  h.assistant([{ type: 'reasoning', text: 'long again' }], 2)
+  h.end('max-tokens')
+  h.user('TASK C')
+  h.assistant([{ type: 'text', text: 'ok C' }])
+  h.end('completed')
+  const { result } = await h.ctxCommands().execute(h.agent, '/clean-failed-steps', [], new AbortController().signal)
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /^🚫 AI非表示：出力上限で切れた返答 2件（turn 1〜3）と、古いやり直しの指示 1件/)
+  assert.deepEqual(h.visible(), ['system:SYS', 'user:TASK A', 'assistant:ok A', 'user:TASK B', 'assistant:tool-call', 'tool:out', 'user:TASK C', 'assistant:ok C'])
+  const again = await h.ctxCommands().execute(h.agent, '/clean-failed-steps', [], new AbortController().signal)
+  assert.match(again.result.text, /ありません/)
+})
+
+test('failedNodes picks only the last reply of a max-tokens turn', () => {
+  const ev = (seq, type, data) => ({ seq, type, data })
+  const surface = [ev(1, 'assistant/message', { turn: 1 }), ev(2, 'tool/result', { turn: 1 }), ev(3, 'assistant/message', { turn: 1 }), ev(4, 'assistant/message', { turn: 2 })]
+  const { replies } = failedNodes(surface, [...surface, ev(5, 'turn/end', { turn: 1, reason: { kind: 'max-tokens' } }), ev(6, 'turn/end', { turn: 2, reason: { kind: 'completed' } })])
+  assert.deepEqual(replies.map(e => e.seq), [3])
 })

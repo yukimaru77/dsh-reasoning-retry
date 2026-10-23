@@ -11,7 +11,7 @@
 import { createSystemMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 
 export const name = 'reasoning-retry'
-export const inject = ['agents', 'sessions', 'goals', 'llm', 'systemPrompt']
+export const inject = ['agents', 'sessions', 'goals', 'llm', 'systemPrompt', 'commands']
 
 export const DEFAULTS = {
   enabled: true,
@@ -31,6 +31,9 @@ export const DEFAULTS = {
 }
 
 const RETRY_SOURCE = 'max-tokens-retry'
+// Messages of earlier versions of this plugin, hidden by /clean-failed-steps.
+const OLD_RETRY_SOURCES = new Set(['reasoning-retry', 'reasoning-retry-note'])
+const MARKER_COMMAND = 'ai-hidden'
 // Context the harness injects into a turn; it is not the input a step responds to.
 const CONTEXT_SOURCES = new Set(['time-context', 'runtime-context', 'agent-instructions', 'skill-catalog'])
 
@@ -102,6 +105,36 @@ export function stepInput(surface, failedSeq) {
   const prompts = nodes.filter(event => event.type === 'user/message' && !CONTEXT_SOURCES.has(event.data.source?.kind))
   if (prompts.length === 0) return { kind: 'tool', text: '', deleteFrom: failedSeq }
   return { kind: 'prompt', text: prompts.map(event => messageText(event.data)).join('\n\n'), deleteFrom: prompts[0].seq }
+}
+
+/**
+ * Visible nodes to hide when cleaning a session: the last reply of every turn
+ * that ended at the output limit, and earlier versions' retry messages.
+ * @param surface - visible surface events in order.
+ * @param events - the whole log (a turn's last reply is judged on it, not on what is still visible).
+ */
+export function failedNodes(surface, events) {
+  const turnEnds = new Map()
+  const lastReply = new Map()
+  for (const event of events) {
+    if (event.type === 'turn/end') turnEnds.set(event.data.turn, event.data.reason?.kind)
+    else if (event.type === 'assistant/message') lastReply.set(event.data.turn, event.seq)
+  }
+  const replies = []
+  const notices = []
+  for (const event of surface) {
+    if (event.type === 'assistant/message' && turnEnds.get(event.data.turn) === 'max-tokens' && lastReply.get(event.data.turn) === event.seq) {
+      replies.push(event)
+    } else if (event.type === 'user/message' && OLD_RETRY_SOURCES.has(event.data.source?.kind)) {
+      notices.push(event)
+    }
+  }
+  return { replies, notices }
+}
+
+const turnRange = (turns) => {
+  const list = [...new Set(turns)].sort((a, b) => a - b)
+  return list.length === 0 ? '' : list.length === 1 ? `turn ${list[0]}` : `turn ${list[0]}〜${list.at(-1)}`
 }
 
 /** The rewriter's request, built from every attempt so far. */
@@ -295,6 +328,42 @@ export function apply(ctx, config = {}) {
     return kind === 'prompt' ? `${attempts[0].input}\n\n${steps}` : steps
   }
 
+  /** A card in the transcript (a command result, never sent to the model). */
+  async function mark(agent, text) {
+    try {
+      await ctx.commands.execute(agent, `/${MARKER_COMMAND} ${text}`, [], new AbortController().signal)
+    } catch (error) {
+      log('warn', `could not add the AI-hidden marker: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  ctx.effect(() => ctx.commands.register({
+    name: MARKER_COMMAND,
+    description: 'Marker: the part just above is hidden from the AI (added by reasoning-retry)',
+    recordInput: false,
+    handler: ({ rawInput }) => ({ kind: 'success', text: rawInput.trim() }),
+  }))
+
+  ctx.effect(() => ctx.commands.register({
+    name: 'clean-failed-steps',
+    description: 'Hide replies cut off at the output limit and old retry notices from the AI (the log keeps them)',
+    async handler({ agent }) {
+      if (agent.status !== 'idle') return { kind: 'error', text: 'Run this while the session is idle.' }
+      const events = agent.session.snapshotEvents()
+      const { replies, notices } = failedNodes(visibleSurface(agent), events)
+      if (replies.length + notices.length === 0) return { kind: 'success', text: 'AIから見えている失敗した返答や古いやり直しの指示はありません。' }
+      const lastTurn = Math.max(0, ...events.filter(e => e.type === 'turn/end').map(e => e.data.turn))
+      for (const event of [...replies, ...notices].sort((a, b) => a.seq - b.seq)) removeRange(agent, event.seq, event.seq, lastTurn)
+      const stateNow = stateFor(agent)
+      stateNow.ladder = undefined
+      stateNow.pending = false
+      return {
+        kind: 'success',
+        text: `🚫 AI非表示：出力上限で切れた返答 ${replies.length}件（${turnRange(replies.map(e => e.data.turn))}）と、古いやり直しの指示 ${notices.length}件を、AIから見えなくしました。画面とログには残っていますが、AIには送られません。`,
+      }
+    },
+  }))
+
   async function retry(agent, state) {
     state.pending = false
     const ladder = state.ladder
@@ -312,6 +381,8 @@ export function apply(ctx, config = {}) {
       return
     }
     current.next = text
+    const hidden = ladder.attempts.length > 1 ? '直前のやり直しの入力と返答' : ladder.kind === 'prompt' ? '直前の入力と返答' : '直前の返答'
+    await mark(agent, `🚫 AI非表示：${hidden}（turn ${state.lastAssistant?.turn ?? '?'}）は出力上限で切れたため、AIから見えなくしました。入力の出し方を書き換えて再実行します（${ladder.attempts.length}/${cfg.maxRetries}）。`)
     agent.followup(createUserMessage({
       content: [{ type: 'text', text }],
       source: { kind: RETRY_SOURCE, summary: `rewritten ${ladder.kind === 'prompt' ? 'input' : 'note'} ${ladder.attempts.length}/${cfg.maxRetries}` },
