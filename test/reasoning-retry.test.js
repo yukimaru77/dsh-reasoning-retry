@@ -6,6 +6,7 @@ import {
   repetitionStats,
   renderGuidance,
   renderRetryMessage,
+  staleMaxTokens,
 } from '../index.js'
 
 const tick = () => new Promise(resolve => setTimeout(resolve, 20))
@@ -274,4 +275,16 @@ test('completed reasoning-only defers to an armed goal round', async () => {
   h.emitIdle()
   await tick()
   assert.equal(h.calls.followups.length, 0)
+})
+
+test('a cap once forced below the adapter default is dropped so the default applies again', () => {
+  const headers = [
+    { config: { maxTokens: 32768 }, adapterDefaults: { maxTokens: true } },
+    { config: { maxTokens: 8192 } },
+    { config: { maxTokens: 4096 } },
+  ]
+  assert.equal(staleMaxTokens(headers, 4096), 32768)
+  assert.equal(staleMaxTokens(headers, 32768), undefined)
+  assert.equal(staleMaxTokens([{ config: { maxTokens: 4096 } }], 4096), undefined, 'no adapter default seen: leave it')
+  assert.equal(staleMaxTokens(headers, undefined), undefined)
 })

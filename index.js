@@ -22,6 +22,23 @@ export const DEFAULTS = {
   resumeGoalAfterRetry: true,
   blockGoalAfterRetries: true,
   notifyOnGiveUp: true,
+  // Undo an output cap that a plugin once forced and that now sticks to the
+  // session (the next request reuses the previous request's explicit values).
+  restoreAdapterMaxTokens: true,
+}
+
+/**
+ * The output cap a session last ran with as the adapter default, when its
+ * current explicit cap is lower. DSH reuses the previous request's explicit
+ * values, so a cap lowered once by a plugin otherwise sticks for good.
+ */
+export function staleMaxTokens(headers, proposed) {
+  if (!Number.isInteger(proposed)) return undefined
+  let adapterDefault
+  for (const header of headers) {
+    if (header?.adapterDefaults?.maxTokens === true && Number.isInteger(header.config?.maxTokens)) adapterDefault = header.config.maxTokens
+  }
+  return adapterDefault !== undefined && proposed < adapterDefault ? adapterDefault : undefined
 }
 
 /** Whether an assistant message contains only reasoning blocks. */
@@ -143,6 +160,13 @@ export function apply(ctx, config = {}) {
     if (typeof logger?.[level] === 'function') logger[level](`reasoning-retry: ${message}`)
   }
 
+  /** Remember the last adapter-default output cap this session ran with. */
+  function noteHeader(state, header) {
+    if (header?.adapterDefaults?.maxTokens === true && Number.isInteger(header.config?.maxTokens)) {
+      state.adapterMaxTokens = header.config.maxTokens
+    }
+  }
+
   function stateFor(agent) {
     let state = states.get(agent)
     if (state === undefined) {
@@ -171,6 +195,9 @@ export function apply(ctx, config = {}) {
             case 'tool/result':
               state.lastToolResults.push(textOf(event.data.message))
               while (state.lastToolResults.length > 3) state.lastToolResults.shift()
+              break
+            case 'request/header':
+              noteHeader(state, event.data.header)
               break
             case 'user/message':
               // time-context and other context messages are inserted into a
@@ -363,6 +390,9 @@ export function apply(ctx, config = {}) {
         state.lastToolResults.push(textOf(event.data.message))
         while (state.lastToolResults.length > 3) state.lastToolResults.shift()
         return
+      case 'request/header':
+        noteHeader(state, event.data.header)
+        return
       case 'user/message': {
         const source = event.data.source
         if (!isSemanticUserSource(source)) return
@@ -413,6 +443,18 @@ export function apply(ctx, config = {}) {
         return renderGuidance(maxTokensOf(agent))
       },
     }))
+  }
+
+  if (cfg.restoreAdapterMaxTokens) {
+    ctx.on('agent/request', async ({ agent }, next) => {
+      const config = await next()
+      const state = stateFor(agent)
+      const restored = staleMaxTokens(state.adapterMaxTokens === undefined ? [] : [{ config: { maxTokens: state.adapterMaxTokens }, adapterDefaults: { maxTokens: true } }], config?.maxTokens)
+      if (restored === undefined) return config
+      log('info', `dropped a stale maxTokens ${config.maxTokens}; the adapter default (${restored}) applies again`)
+      const { maxTokens: _stale, ...rest } = config
+      return rest
+    })
   }
 
   ctx.on('agent/inbox/discarded', ({ agent, message }) => {
