@@ -52,6 +52,8 @@ export const DEFAULTS = {
 }
 
 const DEGENERATION_CODE = 'REASONING_DEGENERATED'
+const HINT_TAG = '<previous-attempt-at-this-step>'
+const HINT_OMITTED_TEXT = '[omitted: notes for a re-requested attempt that has finished]'
 // Phrasings that tell the agent to think less; rewritten inputs must change how the work is posed instead.
 const THINK_LESS = /\b(do not|don't|stop|without) (reason|think|hypothesi[sz]|re-?deriv|deliberat)\w*|\breason(ing)? (less|further)\b|推論を(広げ|しな|止め|やめ)|考え(ない|るな|すぎ)|再導出しない|再検討しない/i
 
@@ -117,7 +119,7 @@ export function describeLoop(loop) {
 /** Runtime context for a step re-requested after its reasoning fell into repetition. */
 export function renderLoopHint(loop, carryChars = 6000) {
   return [
-    '<previous-attempt-at-this-step>',
+    HINT_TAG,
     `The previous attempt at this step was stopped: after about ${loop.start} characters its reasoning began repeating the same phrases and never reached an action. That attempt is not in the history. Its reasoning up to the repetition:`,
     '',
     clip(loop.healthy, carryChars),
@@ -261,6 +263,12 @@ export function apply(ctx, config = {}) {
         return
       case 'user/message': {
         const kind = event.data.source?.kind
+        if (kind === 'runtime-context') {
+          // A context snapshot carrying a loop hint is spent once a later snapshot replaces it.
+          if (event.data.content?.some(block => block?.text?.includes(HINT_TAG))) state.hintNodes.push(event.seq)
+          else if (state.hintNodes.length > 0) state.hideHints = true
+          return
+        }
         if (kind === RETRY_SOURCE) {
           state.retrySeq = event.seq
           state.inRetryTurn = true
@@ -278,7 +286,7 @@ export function apply(ctx, config = {}) {
   function stateFor(agent) {
     let state = states.get(agent)
     if (!state) {
-      state = { lastAssistant: undefined, retrySeq: undefined, inRetryTurn: false, ladder: undefined, pending: false, adapterMaxTokens: undefined, step: undefined, loopRetries: new Map(), loopHint: undefined, loopAtTurnEnd: undefined }
+      state = { lastAssistant: undefined, retrySeq: undefined, inRetryTurn: false, ladder: undefined, pending: false, adapterMaxTokens: undefined, step: undefined, loopRetries: new Map(), loopHint: undefined, loopAtTurnEnd: undefined, hintNodes: [] }
       try {
         for (const event of agent.session?.snapshotEvents?.() ?? []) observe(state, event)
       } catch { /* the log only seeds state */ }
@@ -351,7 +359,7 @@ export function apply(ctx, config = {}) {
   }
 
   /** Replace [fromSeq..toSeq] in the model-visible history with a one-line placeholder (the log keeps it). */
-  function removeRange(agent, fromSeq, toSeq) {
+  function removeRange(agent, fromSeq, toSeq, text = OMITTED_TEXT) {
     const nodes = [...(agent.session.surface?.nodes ?? [])]
     let start = nodes.indexOf(fromSeq)
     const end = nodes.indexOf(toSeq)
@@ -359,7 +367,7 @@ export function apply(ctx, config = {}) {
     // Fold into a placeholder right before, so repeated retries leave a single line.
     if (start > 0 && agent.session.eventAt(nodes[start - 1])?.data?.source?.kind === OMITTED_SOURCE) start -= 1
     fromSeq = nodes[start]
-    agent.session.append('user/message', createUserMessage({ content: [{ type: 'text', text: OMITTED_TEXT }], source: { kind: OMITTED_SOURCE } }), {
+    agent.session.append('user/message', createUserMessage({ content: [{ type: 'text', text }], source: { kind: OMITTED_SOURCE } }), {
       surfaceOp: { op: 'replace', startSeq: fromSeq, endSeq: toSeq },
       sourceEventSeqs: nodes.slice(start, end + 1),
     })
@@ -416,6 +424,15 @@ export function apply(ctx, config = {}) {
   function fallback(kind, attempts) {
     const steps = 'Work on this in steps: write the ordered list of steps that remain as visible text, then carry out the first one; continue with the rest in later steps.'
     return kind === 'prompt' ? `${attempts[0].input}\n\n${steps}` : steps
+  }
+
+  /** Hide context snapshots whose loop hint has served its re-requested attempt. */
+  function hideSpentHints(agent, state) {
+    const nodes = new Set(agent.session.surface?.nodes ?? [])
+    for (const seq of state.hintNodes.splice(0)) {
+      if (!nodes.has(seq)) continue
+      try { removeRange(agent, seq, seq, HINT_OMITTED_TEXT) } catch (error) { log('warn', `could not hide a spent loop hint: ${error instanceof Error ? error.message : String(error)}`) }
+    }
   }
 
   /** A card in the transcript (a command result, never sent to the model). */
@@ -496,6 +513,11 @@ export function apply(ctx, config = {}) {
     const state = stateFor(agent)
     observe(state, event)
     if (event.type === 'turn/end') handleTurnEnd(agent, state, event.data)
+    if (state.hideHints) {
+      state.hideHints = false
+      // Appends are not allowed inside this dispatch.
+      setTimeout(() => hideSpentHints(agent, state), 0)
+    }
   })
 
   ctx.on('agent/status', ({ agent, status }) => {

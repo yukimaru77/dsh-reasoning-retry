@@ -336,3 +336,18 @@ test('other errors are left to the next handler', async () => {
   const action = await h.listeners.get('agent/request-error')[0]({ agent: h.agent, turn: 1, step: 1, failure: { code: 'TRANSPORT', message: 'x' } }, async () => 'next')
   assert.equal(action, 'next')
 })
+
+test('a spent loop hint is hidden once a later context snapshot replaces it', async () => {
+  const h = harness()
+  h.user('TASK')
+  const ctxMessage = (text) => h.append('user/message', createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'runtime-context' } }), { surfaceOp: 'append' })
+  ctxMessage('CWD /x\n<previous-attempt-at-this-step>\nlong notes\n</previous-attempt-at-this-step>')
+  h.assistant([{ type: 'tool-call', id: 'c1', name: 'bash', arguments: '{}' }])
+  h.tool('c1', 'ok')
+  ctxMessage('CWD /x')
+  await tick()
+  assert.ok(h.visible().every(line => !line.includes('long notes')))
+  assert.ok(h.visible().includes('user:[omitted: notes for a re-requested attempt that has finished]'))
+  h.end('completed')
+  h.assertStorable()
+})
