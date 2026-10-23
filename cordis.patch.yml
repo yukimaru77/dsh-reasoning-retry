@@ -1,18 +1,18 @@
-# Reasoning-only output-limit stops, handled through instructions only: matching
-# models are told their output budget and to work in visible steps, and a cut-off
-# reply is retried with the end of its reasoning so the model continues from it.
+# Output-limit stops are handled by re-posing the input, never by limiting
+# thought: the failed step is removed from the model-visible history and re-run
+# with an input the model rewrote from the input and its reasoning.
 - insert:
     - id: reasoning-retry
       name: dsh-reasoning-retry
       config:
         maxRetries: 2
         guidanceModels: deepseek
-        reasoningTailChars: 4000
-        repetition:
-          ngram: 8
-          minCount: 5
-          minRatio: 0.25
-        retryOnCompletedReasoningOnly: true
+        rewriteInputChars: 12000
+        rewriteReasoningChars: 12000
+        rewriter:
+          maxTokens: 16384
+          timeoutMs: 180000
         resumeGoalAfterRetry: true
         blockGoalAfterRetries: true
         notifyOnGiveUp: true
+        restoreAdapterMaxTokens: true
