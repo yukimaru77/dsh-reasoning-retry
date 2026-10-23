@@ -8,7 +8,15 @@
 // input and reasoning, the rewritten input and its reasoning. The input is
 // whatever the failed step received: a user or goal prompt, or tool results,
 // which are kept as they are and get a framing note instead.
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+//
+// Reasoning that collapses into repeating the same phrases is caught while it
+// streams: the attempt is cut, kept out of the model-visible history (a failed
+// request attempt is log-only), and the same step is requested again with the
+// reasoning written before the repetition and the phrases it got stuck on.
+import { createUserMessage, isAgentLoopRequest } from '@deepseek-ai/dsh-llm'
+import { detectDegeneration } from './degeneration.js'
+
+export { detectDegeneration } from './degeneration.js'
 
 export const name = 'reasoning-retry'
 export const inject = ['agents', 'sessions', 'goals', 'llm', 'systemPrompt', 'commands']
@@ -28,7 +36,24 @@ export const DEFAULTS = {
   // Undo an output cap that a plugin once forced and that now sticks to the
   // session (the next request reuses the previous request's explicit values).
   restoreAdapterMaxTokens: true,
+  degeneration: {
+    enabled: true,
+    // Cut an attempt once its repetition is this long (shorter loops often recover on their own).
+    minLoopChars: 20000,
+    // How often (in streamed characters) to check.
+    checkEveryChars: 4000,
+    // Same-step re-requests before the output-limit ladder takes over.
+    inStepRetries: 2,
+    // Characters of the pre-repetition reasoning handed to the next attempt.
+    carryChars: 6000,
+    // Optional sampling temperature for re-requested attempts (unset: provider default).
+    retryTemperature: undefined,
+  },
 }
+
+const DEGENERATION_CODE = 'REASONING_DEGENERATED'
+// Phrasings that tell the agent to think less; rewritten inputs must change how the work is posed instead.
+const THINK_LESS = /\b(do not|don't|stop|without) (reason|think|hypothesi[sz]|re-?deriv|deliberat)\w*|\breason(ing)? (less|further)\b|推論を(広げ|しな|止め|やめ)|考え(ない|るな|すぎ)|再導出しない|再検討しない/i
 
 const RETRY_SOURCE = 'max-tokens-retry'
 // Messages of earlier versions of this plugin, hidden by /clean-failed-steps.
@@ -74,8 +99,34 @@ const blockText = (block) => {
   return ''
 }
 const messageText = (message) => (Array.isArray(message?.content) ? message.content.map(blockText).filter(Boolean).join('\n') : '')
-const reasoningOf = (message) => (Array.isArray(message?.content)
+const rawReasoningOf = (message) => (Array.isArray(message?.content)
   ? message.content.filter(block => block?.type === 'reasoning').map(block => block.text ?? '').join('\n') : '')
+/** Reasoning for the rewriter: a repetition loop is replaced by a short account of it. */
+const reasoningOf = (message) => {
+  const text = rawReasoningOf(message)
+  const loop = detectDegeneration(text)
+  return loop ? `${loop.healthy}\n\n${describeLoop(loop)}` : text
+}
+
+/** One line about a repetition loop, for model-facing text. */
+export function describeLoop(loop) {
+  const phrases = loop.phrases.map(({ phrase, count }) => `"${phrase}" (×${count})`).join(', ')
+  return `[From here the reasoning repeated the same phrases for ${loop.loopChars} characters without reaching an action: ${phrases || 'short fragments'}.]`
+}
+
+/** Runtime context for a step re-requested after its reasoning fell into repetition. */
+export function renderLoopHint(loop, carryChars = 6000) {
+  return [
+    '<previous-attempt-at-this-step>',
+    `The previous attempt at this step was stopped: after about ${loop.start} characters its reasoning began repeating the same phrases and never reached an action. That attempt is not in the history. Its reasoning up to the repetition:`,
+    '',
+    clip(loop.healthy, carryChars),
+    '',
+    describeLoop(loop),
+    'Pick up from where that reasoning stood. The repeated phrases mark the open question: settle it with a tool call or a concrete decision, then continue the step.',
+    '</previous-attempt-at-this-step>',
+  ].join('\n')
+}
 const visibleOf = (message) => (Array.isArray(message?.content)
   ? message.content.filter(block => block?.type !== 'reasoning').map(blockText).filter(Boolean).join('\n') : '')
 
@@ -165,7 +216,12 @@ export function renderRewriteRequest(kind, attempts, { inputChars = 12000, reaso
 }
 
 function resolveConfig(input = {}) {
-  const config = { ...DEFAULTS, ...input, rewriter: { ...DEFAULTS.rewriter, ...(input.rewriter ?? {}) } }
+  const config = {
+    ...DEFAULTS,
+    ...input,
+    rewriter: { ...DEFAULTS.rewriter, ...(input.rewriter ?? {}) },
+    degeneration: { ...DEFAULTS.degeneration, ...(input.degeneration ?? {}) },
+  }
   if (typeof config.enabled !== 'boolean') throw new Error('reasoning-retry: enabled must be a boolean')
   if (!Number.isInteger(config.maxRetries) || config.maxRetries < 0) throw new Error('reasoning-retry: maxRetries must be a non-negative integer')
   if (typeof config.guidanceModels !== 'string') throw new Error('reasoning-retry: guidanceModels must be a string')
@@ -191,6 +247,12 @@ export function apply(ctx, config = {}) {
     switch (event.type) {
       case 'assistant/message':
         state.lastAssistant = { seq: event.seq, turn: event.data.turn, message: event.data.message }
+        // A committed reply settles the step: the next one starts without the repetition hint.
+        state.loopHint = undefined
+        return
+      case 'turn/end':
+        state.loopHint = undefined
+        state.loopRetries.clear()
         return
       case 'request/header':
         if (event.data.header?.adapterDefaults?.maxTokens === true && Number.isInteger(event.data.header.config?.maxTokens)) {
@@ -216,7 +278,7 @@ export function apply(ctx, config = {}) {
   function stateFor(agent) {
     let state = states.get(agent)
     if (!state) {
-      state = { lastAssistant: undefined, retrySeq: undefined, inRetryTurn: false, ladder: undefined, pending: false, adapterMaxTokens: undefined }
+      state = { lastAssistant: undefined, retrySeq: undefined, inRetryTurn: false, ladder: undefined, pending: false, adapterMaxTokens: undefined, step: undefined, loopRetries: new Map(), loopHint: undefined, loopAtTurnEnd: undefined }
       try {
         for (const event of agent.session?.snapshotEvents?.() ?? []) observe(state, event)
       } catch { /* the log only seeds state */ }
@@ -304,6 +366,15 @@ export function apply(ctx, config = {}) {
   }
 
   async function rewrite(agent, ladder) {
+    const request = renderRewriteRequest(ladder.kind, ladder.attempts, { inputChars: cfg.rewriteInputChars, reasoningChars: cfg.rewriteReasoningChars })
+    const first = await askRewriter(agent, request)
+    if (first === undefined || !THINK_LESS.test(first)) return first
+    log('info', 'the rewrite told the agent to think less; asking again')
+    const second = await askRewriter(agent, `${request}\n\nA previous answer was rejected because it told the agent not to reason, to stop hypothesizing, or not to re-derive things. Do not restrict the agent's thinking at all; change only how the work is posed.`)
+    return second !== undefined && !THINK_LESS.test(second) ? second : undefined
+  }
+
+  async function askRewriter(agent, request) {
     const route = agent.session?.requestHeader?.()?.config ?? agent.options
     if (!route?.provider || !route?.model) return undefined
     const controller = new AbortController()
@@ -314,15 +385,25 @@ export function apply(ctx, config = {}) {
         model: route.model,
         maxTokens: cfg.rewriter.maxTokens,
         messages: [createUserMessage({
-          content: [{ type: 'text', text: renderRewriteRequest(ladder.kind, ladder.attempts, { inputChars: cfg.rewriteInputChars, reasoningChars: cfg.rewriteReasoningChars }) }],
+          content: [{ type: 'text', text: request }],
           source: { kind: 'reasoning-retry', form: 'notice', summary: 'rewrite request' },
         })],
         system: 'You re-pose inputs for an AI coding agent so that each step can be completed within one reply. Output only the new message text.',
         signal: controller.signal,
       })
       let text = ''
+      let reasoning = ''
+      let checked = 0
       for await (const chunk of stream) {
         if (chunk.type === 'text-delta') text += chunk.text
+        else if (chunk.type === 'reasoning-delta') {
+          reasoning += chunk.text
+          if (reasoning.length - checked >= cfg.degeneration.checkEveryChars) {
+            checked = reasoning.length
+            const loop = detectDegeneration(reasoning)
+            if (loop && loop.loopChars >= cfg.degeneration.minLoopChars) { log('warn', 'the rewriter fell into repetition'); controller.abort(); return undefined }
+          }
+        }
       }
       return text.trim() || undefined
     } catch (error) {
@@ -330,6 +411,7 @@ export function apply(ctx, config = {}) {
       return undefined
     } finally { clearTimeout(timer) }
   }
+
 
   function fallback(kind, attempts) {
     const steps = 'Work on this in steps: write the ordered list of steps that remain as visible text, then carry out the first one; continue with the rest in later steps.'
@@ -399,7 +481,8 @@ export function apply(ctx, config = {}) {
     }
     current.next = text
     const hidden = ladder.attempts.length > 1 ? '直前のやり直しの入力と返答' : ladder.kind === 'prompt' ? '直前の入力と返答' : '直前の返答'
-    await mark(agent, `🚫 AI非表示：${hidden}（turn ${state.lastAssistant?.turn ?? '?'}）は出力上限で切れたため、AIから見えなくしました。入力の出し方を書き換えて再実行します（${ladder.attempts.length}/${cfg.maxRetries}）。`)
+    const why = state.loopAtTurnEnd === state.lastAssistant?.turn ? '推論が同じ語句の繰り返しから抜けられなかった' : '出力上限で切れた'
+    await mark(agent, `🚫 AI非表示：${hidden}（turn ${state.lastAssistant?.turn ?? '?'}）は${why}ため、AIから見えなくしました。入力の出し方を書き換えて再実行します（${ladder.attempts.length}/${cfg.maxRetries}）。`)
     agent.followup(createUserMessage({
       content: [{ type: 'text', text }],
       source: { kind: RETRY_SOURCE, summary: `rewritten ${ladder.kind === 'prompt' ? 'input' : 'note'} ${ladder.attempts.length}/${cfg.maxRetries}` },
@@ -425,6 +508,83 @@ export function apply(ctx, config = {}) {
     else if (action === 'give-up') giveUp(agent, state)
     if (state.pending) void retry(agent, state)
   })
+
+  // --- Repetition loops in streamed reasoning -------------------------------------------
+  const loopCfg = cfg.degeneration
+  if (loopCfg.enabled) {
+    ctx.on('agent/request', async ({ agent, turn, step }, next) => {
+      const config = await next()
+      const state = stateFor(agent)
+      state.step = { turn, step }
+      if (state.loopHint !== undefined && loopCfg.retryTemperature !== undefined && config) return { ...config, temperature: loopCfg.retryTemperature }
+      return config
+    })
+
+    ctx.on('llm/stream', function (options, next) {
+      if (!isAgentLoopRequest(options)) return next()
+      const agent = ctx.agents.get(options.sessionId)
+      if (agent === undefined) return next()
+      return guardStream(next(), agent, stateFor(agent))
+    })
+
+    ctx.on('agent/request-error', async ({ agent, turn, step, failure }, next) => {
+      if (failure?.code !== DEGENERATION_CODE) return next()
+      const state = stateFor(agent)
+      const key = `${turn}:${step}`
+      const count = state.loopRetries.get(key) ?? 0
+      const loop = state.loopHint?.loop
+      await mark(agent, `🔁 推論の繰り返しを検知：turn ${turn} の手順 ${step} で、推論が同じ語句${loop?.phrases?.[0] ? `（「${loop.phrases[0].phrase.slice(0, 40)}」など）` : ''}の繰り返しに入ったため、この試行を打ち切りました（AIからは見えません）。繰り返す前までの推論を渡して、同じ手順をやり直します（${count}/${loopCfg.inStepRetries}）。`)
+      return { kind: 'retry' }
+    })
+
+    ctx.effect(() => ctx.systemPrompt.context({
+      name: 'reasoning-retry-loop',
+      order: 131,
+      text: ({ scope }) => {
+        const hint = states.get(scope)?.loopHint
+        return hint === undefined ? '' : renderLoopHint(hint.loop, loopCfg.carryChars)
+      },
+    }))
+  }
+
+  /** Pass chunks through; cut the attempt when its reasoning falls into a long repetition loop. */
+  async function* guardStream(source, agent, state) {
+    const iterator = source[Symbol.asyncIterator]()
+    const texts = new Map()
+    let streamed = 0
+    let checked = 0
+    try {
+      while (true) {
+        const { value, done } = await iterator.next()
+        if (done) return
+        yield value
+        if (value.type !== 'reasoning-delta') continue
+        const text = (texts.get(value.index) ?? '') + value.text
+        texts.set(value.index, text)
+        streamed += value.text.length
+        if (streamed - checked < loopCfg.checkEveryChars) continue
+        checked = streamed
+        const loop = detectDegeneration(text)
+        if (!loop || loop.loopChars < loopCfg.minLoopChars) continue
+        const at = state.step ?? { turn: 0, step: 0 }
+        const key = `${at.turn}:${at.step}`
+        const count = state.loopRetries.get(key) ?? 0
+        log('warn', `reasoning fell into repetition at turn ${at.turn} step ${at.step} (${loop.loopChars} chars looping)`)
+        if (count < loopCfg.inStepRetries) {
+          state.loopRetries.set(key, count + 1)
+          state.loopHint = { loop, ...at }
+          yield { type: 'finish', reason: { kind: 'error', failure: { message: 'The reasoning fell into a repetition loop; the attempt was cut.', code: DEGENERATION_CODE } } }
+        } else {
+          // Same-step attempts are spent: end the step as an output-limit stop for the rewrite ladder.
+          state.loopAtTurnEnd = at.turn
+          yield { type: 'finish', reason: { kind: 'max-tokens' } }
+        }
+        return
+      }
+    } finally {
+      await iterator.return?.()
+    }
+  }
 
   if (cfg.restoreAdapterMaxTokens) {
     ctx.on('agent/request', async ({ agent }, next) => {

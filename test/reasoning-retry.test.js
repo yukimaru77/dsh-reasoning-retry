@@ -1,9 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { Session } from '@deepseek-ai/dsh-session'
-import { createSystemMessage, createToolResultMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createSystemMessage, createToolResultMessage, createUserMessage, markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
 import { assertReleasedV4Relationships } from '@deepseek-ai/dsh-session-format-v3-to-v4'
-import { apply, clip, failedNodes, renderGuidance, renderRewriteRequest, staleMaxTokens, stepInput } from '../index.js'
+import { apply, clip, detectDegeneration, renderLoopHint, failedNodes, renderGuidance, renderRewriteRequest, staleMaxTokens, stepInput } from '../index.js'
 
 const tick = (ms = 20) => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -12,6 +12,7 @@ function harness({ rewrites = [], goalActivation = 'disarmed', model = 'deepseek
   const session = Session.create('s1')
   const listeners = new Map()
   const calls = { rewriteRequests: [], resume: [], block: [], notes: [] }
+  const contexts = new Map()
   let turn = 0
   let step = null
   let assistantId = 0
@@ -75,7 +76,7 @@ function harness({ rewrites = [], goalActivation = 'disarmed', model = 'deepseek
         return { commandId, result }
       },
     },
-    systemPrompt: { context: (c) => { calls.context = c; return () => {} } },
+    systemPrompt: { context: (c) => { calls.context = c; contexts.set(c.name, c); return () => {} } },
     effect: (fn) => fn(),
     on(name, fn) { listeners.set(name, [...(listeners.get(name) ?? []), fn]); return () => {} },
   }
@@ -109,6 +110,8 @@ function harness({ rewrites = [], goalActivation = 'disarmed', model = 'deepseek
     visible() { return session.deriveMessages().map(m => `${m.role}:${m.content.map(b => b.text ?? b.type).join('|')}`) },
   }
   api.ctxCommands = () => ctx.commands
+  api.listeners = listeners
+  api.contexts = contexts
   apply(ctx, { maxRetries: 2 })
   return api
 }
@@ -273,4 +276,63 @@ test('the stored-format rules reject a system/message outside a turn (why placeh
   const seq = h.session.surface.nodes.at(-1)
   h.session.append('system/message', { message: createSystemMessage(''), turn: 1, step: 1 }, { surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq }, sourceEventSeqs: [seq] })
   assert.throws(() => h.assertStorable(), /does not match an open turn and step/)
+})
+
+// Ordinary reasoning: varied sentences, no loop.
+const prose = (n) => Array.from({ length: n }, (_, i) => `Step ${i} checks file part${i} for value ${i * 7 % 13} and notes result r${i}.`).join(' ')
+const loopText = (n) => Array.from({ length: n }, () => "the camera's world matrix; the camera's position 0.59; the sample 0.125.").join(' ')
+
+test('detectDegeneration finds where a repetition loop starts and what it repeats', () => {
+  assert.equal(detectDegeneration(prose(800)), undefined)
+  const healthy = prose(60)
+  const loop = detectDegeneration(`${healthy} ${loopText(400)}`)
+  assert.ok(loop)
+  assert.ok(Math.abs(loop.start - healthy.length) < 300, `start ${loop.start} vs ${healthy.length}`)
+  assert.match(loop.phrases[0].phrase, /camera's world matrix|camera's position|sample 0/)
+})
+
+async function* chunks(text, size = 1000) {
+  yield { type: 'block-start', index: 0, blockType: 'reasoning' }
+  for (let i = 0; i < text.length; i += size) yield { type: 'reasoning-delta', index: 0, text: text.slice(i, i + size) }
+  yield { type: 'finish', reason: { kind: 'max-tokens' } }
+}
+
+test('a looping attempt is cut, re-requested in the same step with the pre-loop reasoning, then handed to the ladder', async () => {
+  const h = harness()
+  h.user('TASK')
+  const one = (name) => h.listeners.get(name)[0]
+  const request = () => one('agent/request')({ agent: h.agent, turn: 1, step: 1 }, async () => ({ provider: 'h200', model: 'deepseek-v4' }))
+  const stream = async () => {
+    const out = []
+    for await (const c of one('llm/stream')(markAgentLoopRequest({ provider: 'h200', model: 'deepseek-v4', messages: [], sessionId: 's1' }), () => chunks(`${prose(60)} ${loopText(800)}`))) out.push(c)
+    return out
+  }
+  for (const attempt of [1, 2]) {
+    await request()
+    const out = await stream()
+    assert.deepEqual(out.at(-1).reason.failure.code, 'REASONING_DEGENERATED')
+    assert.ok(out.filter(c => c.type === 'reasoning-delta').length < 60, 'cut early')
+    const action = await one('agent/request-error')({ agent: h.agent, turn: 1, step: 1, failure: out.at(-1).reason.failure }, async () => undefined)
+    assert.deepEqual(action, { kind: 'retry' })
+    assert.match(h.cards().at(-1), new RegExp(`^🔁 推論の繰り返しを検知.*（${attempt}/2）`))
+    const hint = h.contexts.get('reasoning-retry-loop').text({ scope: h.agent })
+    assert.match(hint, /Step 0 checks file part0/)
+  }
+  await request()
+  const last = await stream()
+  assert.deepEqual(last.at(-1).reason, { kind: 'max-tokens' }, 'third loop goes to the output-limit ladder')
+})
+
+test('the loop hint carries the reasoning before the loop and names the repeated phrases', () => {
+  const loop = detectDegeneration(`${prose(60)} ${loopText(400)}`)
+  const hint = renderLoopHint(loop)
+  assert.match(hint, /Step 0 checks file part0/)
+  assert.match(hint, /camera's/)
+  assert.doesNotMatch(hint, /do not (think|reason)|think less|stop thinking/i)
+})
+
+test('other errors are left to the next handler', async () => {
+  const h = harness()
+  const action = await h.listeners.get('agent/request-error')[0]({ agent: h.agent, turn: 1, step: 1, failure: { code: 'TRANSPORT', message: 'x' } }, async () => 'next')
+  assert.equal(action, 'next')
 })

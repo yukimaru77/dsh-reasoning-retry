@@ -16,3 +16,9 @@
         blockGoalAfterRetries: true
         notifyOnGiveUp: true
         restoreAdapterMaxTokens: true
+        degeneration:
+          enabled: true
+          minLoopChars: 20000
+          checkEveryChars: 4000
+          inStepRetries: 2
+          carryChars: 6000
