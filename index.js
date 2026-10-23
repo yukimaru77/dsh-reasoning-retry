@@ -8,7 +8,7 @@
 // input and reasoning, the rewritten input and its reasoning. The input is
 // whatever the failed step received: a user or goal prompt, or tool results,
 // which are kept as they are and get a framing note instead.
-import { createSystemMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 
 export const name = 'reasoning-retry'
 export const inject = ['agents', 'sessions', 'goals', 'llm', 'systemPrompt', 'commands']
@@ -35,7 +35,11 @@ const RETRY_SOURCE = 'max-tokens-retry'
 const OLD_RETRY_SOURCES = new Set(['reasoning-retry', 'reasoning-retry-note'])
 const MARKER_COMMAND = 'ai-hidden'
 // Context the harness injects into a turn; it is not the input a step responds to.
-const CONTEXT_SOURCES = new Set(['time-context', 'runtime-context', 'agent-instructions', 'skill-catalog'])
+const OMITTED_SOURCE = 'max-tokens-omitted'
+const CONTEXT_SOURCES = new Set(['time-context', 'runtime-context', 'agent-instructions', 'skill-catalog', OMITTED_SOURCE])
+// Stands in for removed history. A user/message (not an empty system/message) because only
+// user messages may replace surface nodes outside a turn in the stored log format.
+const OMITTED_TEXT = '[omitted: an earlier attempt that was cut off at the output limit]'
 
 /**
  * The output cap a session last ran with as the adapter default, when its
@@ -283,13 +287,16 @@ export function apply(ctx, config = {}) {
     state.pending = true
   }
 
-  /** Remove [fromSeq..toSeq] from the model-visible history with an empty system node (the log keeps it). */
-  function removeRange(agent, fromSeq, toSeq, turn) {
+  /** Replace [fromSeq..toSeq] in the model-visible history with a one-line placeholder (the log keeps it). */
+  function removeRange(agent, fromSeq, toSeq) {
     const nodes = [...(agent.session.surface?.nodes ?? [])]
-    const start = nodes.indexOf(fromSeq)
+    let start = nodes.indexOf(fromSeq)
     const end = nodes.indexOf(toSeq)
     if (start < 0 || end < start) throw new Error(`range ${fromSeq}..${toSeq} is not visible`)
-    agent.session.append('system/message', { message: createSystemMessage(''), turn, step: 1 }, {
+    // Fold into a placeholder right before, so repeated retries leave a single line.
+    if (start > 0 && agent.session.eventAt(nodes[start - 1])?.data?.source?.kind === OMITTED_SOURCE) start -= 1
+    fromSeq = nodes[start]
+    agent.session.append('user/message', createUserMessage({ content: [{ type: 'text', text: OMITTED_TEXT }], source: { kind: OMITTED_SOURCE } }), {
       surfaceOp: { op: 'replace', startSeq: fromSeq, endSeq: toSeq },
       sourceEventSeqs: nodes.slice(start, end + 1),
     })
@@ -352,8 +359,17 @@ export function apply(ctx, config = {}) {
       const events = agent.session.snapshotEvents()
       const { replies, notices } = failedNodes(visibleSurface(agent), events)
       if (replies.length + notices.length === 0) return { kind: 'success', text: 'AIから見えている失敗した返答や古いやり直しの指示はありません。' }
-      const lastTurn = Math.max(0, ...events.filter(e => e.type === 'turn/end').map(e => e.data.turn))
-      for (const event of [...replies, ...notices].sort((a, b) => a.seq - b.seq)) removeRange(agent, event.seq, event.seq, lastTurn)
+      // One placeholder per run of adjacent hidden nodes.
+      const hide = new Set([...replies, ...notices].map(e => e.seq))
+      const runs = []
+      let prevHidden = false
+      for (const seq of agent.session.surface.nodes) {
+        if (!hide.has(seq)) { prevHidden = false; continue }
+        if (prevHidden) runs.at(-1)[1] = seq
+        else runs.push([seq, seq])
+        prevHidden = true
+      }
+      for (const [from, to] of runs) removeRange(agent, from, to)
       const stateNow = stateFor(agent)
       stateNow.ladder = undefined
       stateNow.pending = false
@@ -374,7 +390,7 @@ export function apply(ctx, config = {}) {
     const text = (await rewrite(agent, ladder)) ?? fallback(ladder.kind, ladder.attempts)
     if (agent.status !== 'idle' || state.ladder !== ladder) return
     try {
-      removeRange(agent, current.deleteFrom, current.failedSeq, state.lastAssistant?.turn ?? 0)
+      removeRange(agent, current.deleteFrom, current.failedSeq)
     } catch (error) {
       log('warn', `could not remove the failed step: ${error instanceof Error ? error.message : String(error)}`)
       state.ladder = undefined
