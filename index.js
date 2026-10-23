@@ -23,7 +23,7 @@ export const inject = ['agents', 'sessions', 'goals', 'llm', 'systemPrompt', 'co
 
 export const DEFAULTS = {
   enabled: true,
-  maxRetries: 2,
+  maxRetries: 5,
   // Models (provider/model, case-insensitive) that get the standing step-by-step guidance.
   guidanceModels: 'deepseek',
   // Characters of each input and reasoning shown to the rewriter (head and tail kept).

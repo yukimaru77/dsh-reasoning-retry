@@ -5,7 +5,7 @@
     - id: reasoning-retry
       name: dsh-reasoning-retry
       config:
-        maxRetries: 2
+        maxRetries: 5
         guidanceModels: deepseek
         rewriteInputChars: 12000
         rewriteReasoningChars: 12000
